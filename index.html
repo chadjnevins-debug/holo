@@ -90,10 +90,13 @@
     <button data-m="3">Envoy</button><button data-m="4">Explorer</button><button data-m="0">Pip</button><button data-m="1">Planet</button><button data-m="2">Ball</button>
   </div>
   <label class="chk"><input type="checkbox" data-key="mono"> Classic blue transmission look</label>
+  <label class="chk"><input type="checkbox" data-key="sound"> Projector sound</label>
+  <label>Glass reflection <output data-for="glass"></output><input type="range" data-key="glass" min="0" max="1" step="0.05"></label>
   <label>Size <output data-for="size"></output><input type="range" data-key="size" min="0.6" max="1.3" step="0.01"></label>
 
   <div class="ttl">Fit to your Duo</div>
   <label>Fold line <output data-for="fold"></output><input type="range" data-key="fold" min="0.3" max="0.7" step="0.005"></label>
+  <label class="chk"><input type="checkbox" data-key="autoAngle"> Detect fold angle automatically</label>
   <label>Fold angle <output data-for="angle"></output><input type="range" data-key="angle" min="85" max="140" step="1"></label>
   <label>Screen size <output data-for="k"></output><input type="range" data-key="k" min="0.11" max="0.21" step="0.001"></label>
 
@@ -138,7 +141,8 @@ function toast(msg,ms){const t=$('toast');t.textContent=msg;t.classList.add('on'
 if(!window.THREE){$('start').innerHTML='<div class="card"><h1>HOLO 3D</h1><p>Couldn’t load the 3D engine. Check your connection and reload.</p></div>';return;}
 
 /* ---------------- settings ---------------- */
-const DEF={fold:.5,angle:90,k:.156,model:3,camX:null,camY:null,fov:70,flipX:false,el:35,dist:380,size:1,bgZoom:2,bgShift:0,preview:false,mono:true};
+const DEF={fold:.5,angle:90,k:.156,model:3,camX:null,camY:null,fov:70,flipX:false,el:35,dist:380,size:1,bgZoom:2,bgShift:0,preview:false,mono:true,
+  autoAngle:true,sound:true,glass:0.5};
 let cfg=Object.assign({},DEF);
 try{Object.assign(cfg,JSON.parse(localStorage.getItem('holo3d')||'{}'))}catch(e){}
 function save(){try{localStorage.setItem('holo3d',JSON.stringify(cfg))}catch(e){}}
@@ -188,7 +192,58 @@ const floorBgMat=new THREE.ShaderMaterial({
 floorBgScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2),floorBgMat));
 const sampleCv=document.createElement('canvas');sampleCv.width=32;sampleCv.height=4;
 const sctx=sampleCv.getContext('2d',{willReadFrequently:true});
-let lastSample=0;
+let lastSample=0;const ambT=new THREE.Vector3();
+
+/* ---------------- sound: projector hum, crackle, materialize sweep ---------------- */
+const snd={ctx:null,master:null,noise:null,
+  init(){
+    if(this.ctx){if(this.ctx.state==='suspended')this.ctx.resume();return;}
+    try{
+      if(navigator.audioSession)navigator.audioSession.type='playback';   // play even with the silent switch on
+      const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+      const c=this.ctx=new AC();
+      this.master=c.createGain();this.master.gain.value=cfg.sound?0.9:0;this.master.connect(c.destination);
+      const lp=c.createBiquadFilter();lp.type='lowpass';lp.frequency.value=420;lp.Q.value=0.7;
+      const hg=c.createGain();hg.gain.value=0.045;lp.connect(hg);hg.connect(this.master);
+      const osc=(type,f,gain)=>{const o=c.createOscillator();o.type=type;o.frequency.value=f;const g=c.createGain();g.gain.value=gain;o.connect(g);g.connect(lp);o.start();};
+      osc('sawtooth',60,1);osc('sine',120,0.6);osc('triangle',180.7,0.15);
+      const lfo=c.createOscillator();lfo.frequency.value=0.35;const lg=c.createGain();lg.gain.value=0.012;lfo.connect(lg);lg.connect(hg.gain);lfo.start();
+      const n=c.createBuffer(1,Math.floor(c.sampleRate*0.5),c.sampleRate);const nd=n.getChannelData(0);for(let i=0;i<nd.length;i++)nd[i]=Math.random()*2-1;this.noise=n;
+    }catch(e){this.ctx=null;}
+  },
+  crackle(amt){const c=this.ctx;if(!c||!cfg.sound||!this.noise)return;amt=amt||1;
+    const s=c.createBufferSource();s.buffer=this.noise;const bp=c.createBiquadFilter();bp.type='bandpass';bp.frequency.value=2500+Math.random()*2500;bp.Q.value=0.8;
+    const g=c.createGain();const t=c.currentTime;g.gain.setValueAtTime(0,t);
+    for(let i=0;i<6;i++){const tt=t+i*0.02+Math.random()*0.012;g.gain.setValueAtTime(0.14*amt*Math.random(),tt);g.gain.setValueAtTime(0,tt+0.008);}
+    s.connect(bp);bp.connect(g);g.connect(this.master);s.start(t);s.stop(t+0.2);},
+  sweep(up){const c=this.ctx;if(!c||!cfg.sound)return;const t=c.currentTime,dur=up?0.95:0.32;
+    const o=c.createOscillator();o.type='sine';const g=c.createGain();
+    o.frequency.setValueAtTime(up?180:900,t);o.frequency.exponentialRampToValueAtTime(up?1400:150,t+dur);
+    g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(0.06,t+0.05);g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    o.connect(g);g.connect(this.master);o.start(t);o.stop(t+dur+0.05);this.crackle(0.7);},
+  setOn(on){if(this.master)this.master.gain.setTargetAtTime(on?0.9:0,this.ctx.currentTime,0.05);}
+};
+
+/* ---------------- fold angle from the motion sensor ---------------- */
+let tiltBeta=null,motionOn=false,flatWarned=false,lastAngleCheck=0;
+function onOrient(e){if(e.beta==null)return;tiltBeta=tiltBeta==null?e.beta:tiltBeta+(e.beta-tiltBeta)*0.15;}
+function enableMotion(){
+  if(motionOn||!cfg.autoAngle)return;
+  const fail=()=>{cfg.autoAngle=false;save();syncInputs();toast('The motion sensor isn’t available here, so set Fold angle with the slider.',6000);};
+  try{
+    if(typeof DeviceOrientationEvent!=='undefined'&&typeof DeviceOrientationEvent.requestPermission==='function'){
+      DeviceOrientationEvent.requestPermission().then(r=>{if(r==='granted'){window.addEventListener('deviceorientation',onOrient);motionOn=true;}else fail();}).catch(fail);
+    }else if('DeviceOrientationEvent' in window){window.addEventListener('deviceorientation',onOrient);motionOn=true;}
+  }catch(e){fail();}
+}
+function autoAngleTick(now){
+  if(!cfg.autoAngle||tiltBeta==null||now-lastAngleCheck<400)return;lastAngleCheck=now;
+  if(tiltBeta<25){ // the sensor is lying flat, so it's in the bottom half and can't see the fold
+    if(!flatWarned){flatWarned=true;toast('Your Duo’s motion sensor seems to be in the flat half, so it can’t measure the fold. Set Fold angle with the slider in ⚙︎.',8000);}
+    return;}
+  const A=clamp(Math.round(180-tiltBeta),85,140);
+  if(Math.abs(A-cfg.angle)>=1){cfg.angle=A;layout();syncInputs();}
+}
 function sampleRoom(now){
   if(now-lastSample<120||!camVideo.videoWidth)return;lastSample=now;
   const vw=camVideo.videoWidth,vh=camVideo.videoHeight,sc=bgMat.uniforms.uScale.value,sh=bgMat.uniforms.uShift.value;
@@ -196,6 +251,8 @@ function sampleRoom(now){
   const sx=u0*vw,sw=sc.x*vw,sy=(1-(v0+0.06*sc.y))*vh,shh=0.06*sc.y*vh;
   try{sctx.drawImage(camVideo,sx,sy,sw,shh,0,0,32,4);}catch(e){return;}
   const d=sctx.getImageData(0,0,32,4).data;
+  let ar=0,ag=0,ab=0;for(let i=0;i<d.length;i+=4){ar+=d[i];ag+=d[i+1];ab+=d[i+2];}const nn=d.length/4*255;
+  ambT.set(ar/nn,ag/nn,ab/nn);
   for(let x=0;x<32;x++){for(let ch=0;ch<3;ch++){let s=0;for(let y=0;y<4;y++)s+=d[(y*32+x)*4+ch];s/=4;
     const lum=(d[x*4]+d[x*4+1]+d[x*4+2])/3;const sat=lum+(s-lum)*0.85;            // match the wall's color grading
     const graded=sat*0.72*[0.92,1.0,1.06][ch];
@@ -220,19 +277,24 @@ function offAxis(cam,pa,pb,pc,pe){
 }
 
 /* ---------------- materials ---------------- */
-const U={time:{value:0},flick:{value:1},scan:{value:6},band:{value:.03},boost:{value:1},mono:{value:1},refl:{value:0},reflH:{value:40}};
+const U={time:{value:0},flick:{value:1},scan:{value:6},band:{value:.03},boost:{value:1},mono:{value:1},refl:{value:0},reflH:{value:40},
+  reveal:{value:1e4},amb:{value:new THREE.Vector3()},envK:{value:0},
+  cam:{value:null},hasCam:{value:0},axis:{value:new THREE.Vector3(0,0,1)},right:{value:new THREE.Vector3(-1,0,0)},up:{value:new THREE.Vector3(0,1,0)},
+  tanH:{value:0.7},vid:{value:new THREE.Vector2(640,480)}};
+const REVEAL_GLSL=`float yy=mix(vY,-vY,uRefl);if(yy>uReveal)discard;float ed=1.0-smoothstep(0.0,2.5,uReveal-yy);`;
 function holoMat(hex,o){o=o||{};
   return new THREE.ShaderMaterial({
     uniforms:{uColor:{value:new THREE.Color(hex)},uTime:U.time,uFlick:U.flick,uScan:U.scan,uBand:U.band,
-      uMono:U.mono,uRefl:U.refl,uReflH:U.reflH,
+      uMono:U.mono,uRefl:U.refl,uReflH:U.reflH,uReveal:U.reveal,uAmb:U.amb,uEnvK:U.envK,...camUniforms(),
       uOpacity:{value:o.opacity!=null?o.opacity:.92},uRim:{value:o.rim!=null?o.rim:1}},
-    vertexShader:`varying vec3 vN;varying vec3 vV;varying float vY;
-      void main(){vec4 wp=modelMatrix*vec4(position,1.0);vY=wp.y;vec4 mv=viewMatrix*wp;vV=mv.xyz;
+    vertexShader:`varying vec3 vN;varying vec3 vV;varying float vY;varying vec3 vWP;varying vec3 vWN;
+      void main(){vec4 wp=modelMatrix*vec4(position,1.0);vY=wp.y;vWP=wp.xyz;vWN=normalize(mat3(modelMatrix)*normal);vec4 mv=viewMatrix*wp;vV=mv.xyz;
       vN=normalize(normalMatrix*normal);gl_Position=projectionMatrix*mv;}`,
     fragmentShader:`uniform vec3 uColor;uniform float uTime;uniform float uOpacity;uniform float uFlick;uniform float uRim;uniform float uScan;uniform float uBand;
-      uniform float uMono;uniform float uRefl;uniform float uReflH;
-      varying vec3 vN;varying vec3 vV;varying float vY;
-      void main(){vec3 n=normalize(vN);vec3 v=normalize(-vV);
+      uniform float uMono;uniform float uRefl;uniform float uReflH;uniform float uReveal;uniform vec3 uAmb;uniform float uEnvK;
+      varying vec3 vN;varying vec3 vV;varying float vY;varying vec3 vWP;varying vec3 vWN;${CAMREF_GLSL}
+      void main(){${REVEAL_GLSL}
+        vec3 n=normalize(vN);vec3 v=normalize(-vV);
         float fr=pow(1.0-clamp(abs(dot(n,v)),0.0,1.0),2.2);
         float d=max(dot(n,normalize(vec3(0.4,0.7,0.9))),0.0);
         vec3 c=uColor*(0.45+0.65*d);
@@ -247,18 +309,66 @@ function holoMat(hex,o){o=o||{};
         float il=step(0.985,fract(sin(row*12.9898+floor(uTime*9.0)*78.233)*43758.5453));
         c=c*scan+vec3(0.3,0.9,1.0)*(band*0.35+il*0.5*uMono);
         c=mix(c,c*vec3(0.75,1.05,1.15),0.35*(1.0-uMono));
+        c+=uAmb*(0.35*fr+0.12);                                   // lit by the real room (see-through)
+        if(uEnvK>0.0){vec3 Vw=normalize(vWP-cameraPosition);vec3 Nw=normalize(vWN);if(dot(Nw,Vw)>0.0)Nw=-Nw;
+          vec4 env=camRef(reflect(Vw,Nw));c+=env.rgb*env.a*uEnvK*(0.15+0.85*fr);}  // shiny edges reflect the camera view
+        c+=vec3(0.6,1.0,1.0)*ed*1.6;                              // bright scan edge while materializing
         float a=uOpacity*(0.8+0.2*fr)*mix(1.0,0.8,uMono);
+        a=max(a,ed*0.9);
         a*=mix(1.0,0.4*smoothstep(-uReflH,0.0,vY),uRefl);
         gl_FragColor=vec4(c*uFlick,a);}`,
     transparent:true,side:o.side||THREE.FrontSide});
 }
 function glowMat(s){
-  return new THREE.ShaderMaterial({uniforms:{uFlick:U.flick,uS:{value:s||1}},
-    vertexShader:`varying vec3 vN;varying vec3 vV;void main(){vec4 mv=modelViewMatrix*vec4(position,1.0);vV=mv.xyz;vN=normalize(normalMatrix*normal);gl_Position=projectionMatrix*mv;}`,
-    fragmentShader:`uniform float uFlick;uniform float uS;varying vec3 vN;varying vec3 vV;
-      void main(){float d=-dot(normalize(vN),normalize(-vV));float i=pow(clamp(d/0.5,0.0,1.0),2.0)*uS*uFlick;
+  return new THREE.ShaderMaterial({uniforms:{uFlick:U.flick,uS:{value:s||1},uReveal:U.reveal,uRefl:U.refl},
+    vertexShader:`varying vec3 vN;varying vec3 vV;varying float vY;void main(){vY=(modelMatrix*vec4(position,1.0)).y;vec4 mv=modelViewMatrix*vec4(position,1.0);vV=mv.xyz;vN=normalize(normalMatrix*normal);gl_Position=projectionMatrix*mv;}`,
+    fragmentShader:`uniform float uFlick;uniform float uS;uniform float uReveal;uniform float uRefl;varying vec3 vN;varying vec3 vV;varying float vY;
+      void main(){${REVEAL_GLSL}float d=-dot(normalize(vN),normalize(-vV));float i=pow(clamp(d/0.5,0.0,1.0),2.0)*uS*uFlick;
       gl_FragColor=vec4(0.35,0.85,1.0,i*0.55);}`,
     side:THREE.BackSide,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false});
+}
+/* shared camera-reflection lookup: direction R -> pixel of whichever camera is on */
+const CAMREF_GLSL=`uniform sampler2D uCam;uniform float uHasCam;uniform vec3 uAxis;uniform vec3 uRight;uniform vec3 uUp;uniform float uTanH;uniform vec2 uVid;
+  vec4 camRef(vec3 R){float z=dot(R,uAxis);if(uHasCam<0.5||z<0.05)return vec4(0.0);
+    float fpx=max(uVid.x,uVid.y)*0.5/uTanH;
+    vec2 uv=vec2(0.5+dot(R,uRight)/z*fpx/uVid.x,0.5+dot(R,uUp)/z*fpx/uVid.y);
+    float e=smoothstep(0.0,0.1,uv.x)*smoothstep(1.0,0.9,uv.x)*smoothstep(0.0,0.1,uv.y)*smoothstep(1.0,0.9,uv.y);
+    return vec4(texture2D(uCam,clamp(uv,0.0,1.0)).rgb,e);}`;
+const camUniforms=()=>({uCam:U.cam,uHasCam:U.hasCam,uAxis:U.axis,uRight:U.right,uUp:U.up,uTanH:U.tanH,uVid:U.vid});
+function visorMat(){ // glossy visor that reflects what the camera sees
+  return new THREE.ShaderMaterial({
+    uniforms:Object.assign(camUniforms(),{uFlick:U.flick,uMono:U.mono,uReveal:U.reveal,uRefl:U.refl,uTime:U.time,uScan:U.scan}),
+    vertexShader:`varying vec3 vWP;varying vec3 vWN;varying float vY;
+      void main(){vec4 wp=modelMatrix*vec4(position,1.0);vWP=wp.xyz;vY=wp.y;vWN=normalize(mat3(modelMatrix)*normal);gl_Position=projectionMatrix*viewMatrix*wp;}`,
+    fragmentShader:`uniform float uFlick;uniform float uMono;uniform float uReveal;uniform float uRefl;uniform float uTime;uniform float uScan;
+      varying vec3 vWP;varying vec3 vWN;varying float vY;${CAMREF_GLSL}
+      void main(){${REVEAL_GLSL}
+        vec3 V=normalize(vWP-cameraPosition);vec3 N=normalize(vWN);if(dot(N,V)>0.0)N=-N;
+        float fr=pow(1.0-clamp(dot(-V,N),0.0,1.0),3.0);
+        vec4 env=camRef(reflect(V,N));
+        vec3 c=vec3(0.03,0.08,0.12)+env.rgb*env.a*(0.35+0.65*fr)+vec3(0.35,0.9,1.0)*fr*0.9;
+        float l=dot(c,vec3(0.3,0.59,0.11));c=mix(c,vec3(0.3,0.7,1.0)*(0.15+l*1.6),uMono*0.85);
+        c*=0.85+0.15*sin(vY*uScan-uTime*5.0);c+=vec3(0.6,1.0,1.0)*ed*1.6;
+        gl_FragColor=vec4(c*uFlick,0.97);}`,
+    transparent:true});
+}
+/* reflection on the glass itself, drawn over each screen */
+const glassScene=new THREE.Scene();
+const glassMat=new THREE.ShaderMaterial({
+  uniforms:Object.assign(camUniforms(),{uP0:{value:new THREE.Vector3()},uPU:{value:new THREE.Vector3()},uPV:{value:new THREE.Vector3()},
+    uN:{value:new THREE.Vector3()},uEye:{value:new THREE.Vector3()},uStrength:{value:0.5}}),
+  vertexShader:`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.0,1.0);}`,
+  fragmentShader:`uniform vec3 uP0;uniform vec3 uPU;uniform vec3 uPV;uniform vec3 uN;uniform vec3 uEye;uniform float uStrength;varying vec2 vUv;${CAMREF_GLSL}
+    void main(){vec3 P=uP0+uPU*vUv.x+uPV*vUv.y;vec3 D=normalize(P-uEye);
+      vec4 env=camRef(reflect(D,uN));if(env.a<=0.0)discard;
+      float cs=clamp(dot(-D,uN),0.0,1.0);float fr=0.04+0.96*pow(1.0-cs,5.0);
+      float k=uStrength*(0.1+fr*0.9)*env.a;
+      gl_FragColor=vec4(env.rgb*k*vec3(0.85,0.95,1.05),1.0);}`,
+  transparent:true,blending:THREE.AdditiveBlending,depthTest:false,depthWrite:false});
+glassScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2),glassMat));
+function drawGlass(p0,pu,pv,n){
+  const u=glassMat.uniforms;u.uP0.value.copy(p0);u.uPU.value.copy(pu);u.uPV.value.copy(pv);u.uN.value.copy(n);u.uEye.value.copy(eye);
+  u.uStrength.value=cfg.glass;renderer.render(glassScene,bgCam);
 }
 function beamMat(s,p){
   return new THREE.ShaderMaterial({uniforms:{uTime:U.time,uBoost:U.boost,uS:{value:s},uP:{value:p}},
@@ -410,7 +520,7 @@ function makeEnvoy(){ // hooded traveler with a lantern staff
 
 function makeExplorer(){ // spacesuit explorer who waves now and then
   const g=new THREE.Group(),b=new THREE.Group();g.add(b);
-  const suit=holoMat(0xdfe8ee),dark=holoMat(0x26323c,{rim:0.8}),accent=holoMat(0xff8a3d),visorM=holoMat(0x0a1a2a,{rim:1.6,opacity:0.97});
+  const suit=holoMat(0xdfe8ee),dark=holoMat(0x26323c,{rim:0.8}),accent=holoMat(0xff8a3d),visorM=visorMat();
   for(const sx of[-1,1]){const bt=new THREE.Mesh(S(0.13,20,14),dark);bt.scale.set(1,0.62,1.5);bt.position.set(0.13*sx,0.08,0.05);b.add(bt);}
   for(const sx of[-1,1]){const th=limb(0.115,0.095,0.5,suit);th.position.set(0.13*sx,1.12,0);
     const sh=limb(0.095,0.08,0.5,suit);th.userData.end.add(sh);b.add(th);
@@ -598,7 +708,7 @@ function layout(){
 }
 
 /* ---------------- cameras ---------------- */
-let mode='none',stream=null,detector=null,detectorP=null;
+let mode='none',stream=null,detector=null,detectorP=null,camFacing=null;
 const camVideo=$('cam'),dots=$('camdots'),dctx=dots.getContext('2d');
 const MP='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.3';
 const MODEL='https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite';
@@ -613,6 +723,8 @@ async function openCamera(facing){
   camVideo.srcObject=stream;
   await camVideo.play().catch(()=>{});
   if(!camVideo.videoWidth)await new Promise(r=>{camVideo.onloadedmetadata=r;setTimeout(r,3000);});
+  if(!bgTex){bgTex=new THREE.VideoTexture(camVideo);bgTex.minFilter=THREE.LinearFilter;bgTex.magFilter=THREE.LinearFilter;}
+  bgMat.uniforms.uTex.value=bgTex;U.cam.value=bgTex;camFacing=facing;
 }
 function loadDetector(){
   if(detector)return Promise.resolve(detector);
@@ -644,8 +756,6 @@ async function setMode(m){
     if(m==='face'){toast('Starting face tracking…',3000);await openCamera('user');await loadDetector();
       toast('Face tracking on. Move your head to look around the hologram. Close one eye for the strongest 3D.',7000);}
     else if(m==='back'){await openCamera('environment');
-      if(!bgTex){bgTex=new THREE.VideoTexture(camVideo);bgTex.minFilter=THREE.LinearFilter;bgTex.magFilter=THREE.LinearFilter;}
-      bgMat.uniforms.uTex.value=bgTex;
       toast('See-through on. Use Background zoom in ⚙︎ to line the room up with what’s really behind the phone.',7000);}
     else stopCamera();
     mode=m;
@@ -697,7 +807,7 @@ function switchTo(i){
   if(trans.state==='out')return;
   if(i==null)i=(cur+1)%models.length;
   if(i===cur&&trans.state==='idle')return;
-  trans={state:'out',t0:clock,next:i};
+  trans={state:'out',t0:clock,next:i};snd.sweep(false);
 }
 const panel=$('panel'),gear=$('gear'),statusEl=$('status'),marker=$('marker');
 let lastTouch=performance.now();
@@ -708,7 +818,8 @@ function placeMarker(){
   marker.style.left=(cfg.camX!=null?cfg.camX*W:W/2)+'px';marker.style.top=(cfg.camY!=null?cfg.camY*H:12)+'px';
 }
 const FMT={fold:v=>Math.round(v*100)+'%',angle:v=>v+'°',k:v=>Math.round(v/0.156*100)+'%',size:v=>Math.round(v*100)+'%',
-  fov:v=>v+'°',el:v=>Math.round(v)+'°',dist:v=>Math.round(v/10)+' cm',bgZoom:v=>(+v).toFixed(1)+'×',bgShift:v=>(+v).toFixed(2)};
+  fov:v=>v+'°',el:v=>Math.round(v)+'°',dist:v=>Math.round(v/10)+' cm',bgZoom:v=>(+v).toFixed(1)+'×',bgShift:v=>(+v).toFixed(2),
+  glass:v=>Math.round(v*100)+'%'};
 const LAYOUT_KEYS=['fold','angle','k','size'];
 function syncInputs(){
   document.querySelectorAll('[data-key]').forEach(inp=>{const key=inp.dataset.key;
@@ -721,6 +832,9 @@ document.querySelectorAll('[data-key]').forEach(inp=>{
     const o=document.querySelector(`output[data-for="${key}"]`);if(o)o.textContent=FMT[key]?FMT[key](cfg[key]):cfg[key];
     if(LAYOUT_KEYS.includes(key))layout();
     if(key==='preview')camVideo.classList.toggle('show',mode==='face'&&cfg.preview);
+    if(key==='angle'&&cfg.autoAngle){cfg.autoAngle=false;syncInputs();}   // moving the slider takes over from the sensor
+    if(key==='autoAngle'&&cfg.autoAngle){flatWarned=false;enableMotion();}
+    if(key==='sound'){snd.init();snd.setOn(cfg.sound);}
     save();wake();});
 });
 function updateUI(){
@@ -738,9 +852,11 @@ document.querySelectorAll('[data-mode]').forEach(b=>b.addEventListener('click',(
 document.querySelectorAll('[data-m]').forEach(b=>b.addEventListener('click',()=>{switchTo(+b.dataset.m);wake();}));
 $('setCam').addEventListener('click',()=>{panel.hidden=true;calibrating=true;$('calib').hidden=false;marker.style.display='none';});
 $('reset').addEventListener('click',()=>{const m=cur;cfg=Object.assign({},DEF,{model:m});save();syncInputs();layout();updateUI();toast('Settings reset.',2500);});
-$('goFace').addEventListener('click',()=>setMode('face'));
-$('goBack').addEventListener('click',()=>setMode('back'));
-$('goNone').addEventListener('click',()=>{$('start').hidden=true;mode='none';updateUI();toast('Drag to change your viewpoint. Tap the hologram to switch it.',5000);});
+const kick=()=>{snd.init();enableMotion();};   // sound and motion both need a tap to start on iPhone
+$('goFace').addEventListener('click',()=>{kick();setMode('face');});
+$('goBack').addEventListener('click',()=>{kick();setMode('back');});
+$('goNone').addEventListener('click',()=>{kick();$('start').hidden=true;mode='none';updateUI();toast('Drag to change your viewpoint. Tap the hologram to switch it.',5000);});
+document.addEventListener('pointerdown',()=>snd.init(),true);
 
 let down=null;
 canvas.addEventListener('pointerdown',e=>{
@@ -768,7 +884,10 @@ window.addEventListener('resize',layout);
 window.addEventListener('orientationchange',()=>setTimeout(layout,300));
 
 /* ---------------- loop ---------------- */
-let last=performance.now(),glitchUntil=0,nextPulse=1.5,lastStatus=0;
+let last=performance.now(),glitchUntil=0,nextPulse=1.5,lastStatus=0,sparkBoost=1;
+const _v1=new THREE.Vector3(),_v2=new THREE.Vector3(),_v3=new THREE.Vector3();
+const fadeMats=[];
+models.forEach(m=>m.traverse(o=>{if((o.isLine||o.isPoints)&&o.material&&!fadeMats.some(f=>f.m===o.material))fadeMats.push({m:o.material,o:o.material.opacity});}));
 syncInputs();layout();updateUI();
 function frame(now){
   const dt=Math.min(0.05,(now-last)/1000);last=now;clock+=dt;const t=clock;
@@ -789,16 +908,21 @@ function frame(now){
     statusEl.style.color=mode==='face'?(track.ok?'#7dffc0':'#ffcf8f'):'';
     drawDots();}
 
-  // hologram switch transition
-  let k=1,flick=0.94+0.06*Math.sin(t*37)*Math.sin(t*13);
-  const e=t-trans.t0;
-  if(trans.state==='out'){k=1-Math.min(e/0.28,1);
-    if(e>=0.28){models[cur].visible=false;cur=trans.next;models[cur].visible=true;userYaw=0;yawVel=0;
-      trans={state:'in',t0:t,next:cur};cfg.model=cur;save();updateUI();pulses.push(t);}}
-  else if(trans.state==='in'){const q=Math.min(e/0.55,1);k=1-Math.pow(1-q,3);if(q<1)flick*=0.55+Math.random()*0.45;else trans.state='idle';}
-  if(t>glitchUntil&&Math.random()<0.004)glitchUntil=t+0.09+Math.random()*0.1;
+  autoAngleTick(now);
+
+  // hologram switch: dissolve top-down, then scan in from the projector upward
+  let prog=1,flick=0.94+0.06*Math.sin(t*37)*Math.sin(t*13);
+  const e=t-trans.t0,yBase=holder.position.y,yTop=yBase+G.objH*1.08+2,span=yTop-yBase+4;
+  if(trans.state==='out'){const q=Math.min(e/0.35,1);prog=1-q;U.reveal.value=yTop-span*q;
+    if(e>=0.35){models[cur].visible=false;cur=trans.next;models[cur].visible=true;userYaw=0;yawVel=0;
+      trans={state:'in',t0:t,next:cur};cfg.model=cur;save();updateUI();pulses.push(t);sparkBoost=5;snd.sweep(true);}}
+  else if(trans.state==='in'){const q=Math.min(e/1.0,1),qe=1-Math.pow(1-q,2);prog=q;U.reveal.value=yBase-2+span*qe;
+    if(q<1)flick*=0.75+Math.random()*0.25;else{trans.state='idle';U.reveal.value=1e4;}}
+  else U.reveal.value=1e4;
+  fadeMats.forEach(f=>f.m.opacity=f.o*prog);
+  sparkBoost+=(1-sparkBoost)*Math.min(1,dt*1.5);
+  if(t>glitchUntil&&Math.random()<0.004){glitchUntil=t+0.09+Math.random()*0.1;snd.crackle(1);}
   let jitter=0;if(t<glitchUntil){flick*=0.55+Math.random()*0.3;jitter=(Math.random()-0.5)*0.12;}
-  wrap.scale.set(1-(1-k)*0.45,Math.max(k,0.001),1-(1-k)*0.45);
   wrap.position.x=jitter;
 
   if(!dragging){userYaw+=yawVel;yawVel*=0.94;if(models[cur].userData.lookAt)userYaw*=0.97;}
@@ -813,7 +937,7 @@ function frame(now){
   U.mono.value+=((cfg.mono?1:0)-U.mono.value)*Math.min(1,dt*6);
   // sparks
   const pa=parts.geometry.attributes.position;
-  for(let i=0;i<partState.length;i++){const p=partState[i];p.p+=dt*p.s;if(p.p>1){p.p=0;p.a=Math.random()*Math.PI*2;}
+  for(let i=0;i<partState.length;i++){const p=partState[i];p.p+=dt*p.s*sparkBoost;if(p.p>1){p.p=0;p.a=Math.random()*Math.PI*2;}
     const r=p.r*(1+0.25*p.p);pa.setXYZ(i,Math.cos(p.a)*r,p.p*G.Hb,G.zc+Math.sin(p.a)*r);}
   pa.needsUpdate=true;
   dust.rotation.y=Math.sin(t*0.05)*0.02;
@@ -830,6 +954,16 @@ function frame(now){
     bgMat.uniforms.uShift.value.set(0,cfg.bgShift*(1-bgMat.uniforms.uScale.value.y));
   }
 
+  // camera used for reflections (front camera faces you, back camera faces away)
+  const camLive=!!(stream&&camVideo.videoWidth&&bgTex);
+  U.hasCam.value=camLive?1:0;
+  if(camLive){
+    if(camFacing==='user'){U.axis.value.copy(G.wallN);U.right.value.copy(G.camRight);}
+    else{U.axis.value.copy(G.wallN).negate();U.right.value.copy(G.camRight).negate();}
+    U.up.value.copy(G.dir);U.tanH.value=Math.tan(cfg.fov*Math.PI/360);U.vid.value.set(camVideo.videoWidth,camVideo.videoHeight);
+  }
+  U.envK.value=camLive?(see?0.55:0.25)*(0.4+cfg.glass*1.2):0;
+  U.amb.value.lerp(see?_tmp.copy(ambT).multiplyScalar(0.55):_tmp.set(0,0,0),Math.min(1,dt*3));
   if(see){
     sampleRoom(now);
     _gp.set(0,G.Rr*0.15+G.objH*0.5,G.zc).project(wallCam);   // hologram light spills onto the room behind it
@@ -841,6 +975,7 @@ function frame(now){
   renderer.setViewport(0,H-foldY,W,foldY);renderer.setScissor(0,H-foldY,W,foldY);renderer.clear();
   if(see){renderer.render(bgScene,bgCam);renderer.clearDepth();}
   renderer.render(scene,wallCam);
+  if(camLive&&cfg.glass>0)drawGlass(G.wa,_v1.subVectors(G.wb,G.wa),_v2.subVectors(G.wc,G.wa),G.wallN);
   renderer.setViewport(0,0,W,H-foldY);renderer.setScissor(0,0,W,H-foldY);renderer.clear();
   if(see){renderer.render(floorBgScene,bgCam);renderer.clearDepth();}
   // reflection of the hologram in the glossy surface
@@ -850,6 +985,7 @@ function frame(now){
   holder.scale.y*=-1;holder.position.y*=-1;flipSides();U.refl.value=0;U.flick.value=fl0;env.visible=true;
   renderer.clearDepth();
   renderer.render(scene,floorCam);
+  if(camLive&&cfg.glass>0)drawGlass(G.fa,_v1.subVectors(G.fb,G.fa),_v2.subVectors(G.fc,G.fa),_v3.set(0,1,0));
   if(!panel.hidden){ // fold guide
     renderer.setScissor(0,H-foldY-1,W,2);renderer.setClearColor(0xffcf8f,1);renderer.clear(true,false,false);renderer.setClearColor(0x01080d,1);
   }
